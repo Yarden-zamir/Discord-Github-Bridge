@@ -158,7 +158,8 @@ async function handleNewThread(thread) {
       .map((id) => forum.availableTags.find((t) => t.id === id)?.name)
       .filter((name) => name && !isSyncLabel(name));
 
-    // Create labels for tags that don't exist
+    // Create labels that don't exist (including sync label)
+    await getOrCreateGitHubLabel(octokit, SYNC_LABEL);
     for (const tagName of tagNames) {
       await getOrCreateGitHubLabel(octokit, tagName);
     }
