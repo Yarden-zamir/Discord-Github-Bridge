@@ -6,9 +6,15 @@ on:
   issue_comment: 
     types: 
       - created
-  issues: 
-    types: 
+  issues:
+    types:
       - opened
+      - closed
+      - reopened
+      - labeled
+      - unlabeled
+      - milestoned
+      - assigned
   pull_request: 
     types: 
       - opened
