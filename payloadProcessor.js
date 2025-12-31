@@ -1,198 +1,342 @@
-// Require the necessary discord.js classes
+const { Events } = require("discord.js");
+const { Octokit } = require("octokit");
+const { env } = require("process");
 const {
-  PermissionsBitField,
-  Client,
-  Events,
-  GatewayIntentBits,
-} = require("discord.js");
-const { exit, env } = require("process");
-const token = env.DISCORD_TOKEN;
-const readline = require("readline");
+  createDiscordClient,
+  createSyncEmbed,
+  createCommentEmbed,
+  hasSyncLabel,
+  isSyncLabel,
+  getRepoOwner,
+  getRepoName,
+  SYNC_LABEL,
+  sleep,
+  findThreadsForIssue,
+  getOrCreateForumTag,
+} = require("./utils.js");
 
-//
-const { Octokit, App } = require("octokit");
-const { getRandomColor } = require("./utils.js");
-
-async function newComment(client, payload) {
-  let issue = payload.event.issue
-  let comment = payload.event.comment;
-  // Check if the issue is already synced with Discord
-  if (comment.user.login === "Discord-Github-Bridge" || comment.body.includes("** on Discord says]")) {
-    console.log("comment by bot, ignoring");
-    client.destroy();
-    return;
-  }
-  let synced = false;
-  if (issue.labels.find((label) => label.name === "synced-with-discord"))
-    synced = true;
-  if (!synced) {
-    //add label
-    const octokit = new Octokit({ auth: env.GITHUB_TOKEN });
-    octokit.rest.issues.addLabels({
-      owner: env.TARGET_REPO.split("/")[0],
-      repo: env.TARGET_REPO.split("/")[1],
-      issue_number: issue.number,
-      labels: ["synced-with-discord"],
-    });
-    console.log("Tagged as synced with discord");
-    createNewPost(client, payload, false)
-    await new Promise(r => setTimeout(r, 2000));
-  }
-
-  const guild = client.guilds.cache.get(env.DISCORD_SERVER_ID);
-  const channels = guild.channels.cache;
-  const messageFetchPromises = [];
-
-  // Fetch messages from appropriate channels
-  channels.forEach((channel) => {
-    if (isEligibleChannel(channel)) {
-      messageFetchPromises.push(
-        processChannelMessages(channel, issue, comment)
-      );
-    }
-  });
-
-  // Wait for all messages to be processed
-  await Promise.all(messageFetchPromises);
-  console.log("Processing complete");
-  client.destroy();
+function createOctokit() {
+  return new Octokit({ auth: env.GITHUB_TOKEN });
 }
 
-// Helper function to determine if a channel is eligible
-function isEligibleChannel(channel) {
+function isIgnoredComment(comment) {
   return (
-    channel.isThread() &&
-    !channel.archived &&
-    channel.parentId === env.DISCORD_INPUT_FORUM_CHANNEL_ID
+    comment.user.login === "Discord-Github-Bridge" ||
+    comment.body.includes("** on Discord says]")
   );
 }
 
-async function processChannelMessages(channel, issue, comment) {
-  const messages = await channel.messages.fetchPinned();
-  messages.forEach((message) => {
-    if (shouldSyncMessage(message, issue.number.toString())) {
-      console.log(`Syncing with issue #${issue.number}`);
-      const newMessage = createMessagePayload(comment, channel.id);
-      const thread = channel.client.channels.cache.get(channel.id);
-      thread.send(newMessage); //no need to pin because this is a regular message
+
+async function createDiscordThread(client, payload) {
+  const issue = payload.event.issue;
+  const channel = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+
+  console.log(`Creating thread for issue #${issue.number}`);
+
+  const syncMessage = createSyncEmbed(
+    issue.number,
+    issue.title,
+    issue.body,
+    issue.html_url,
+    {
+      name: issue.user.login,
+      iconUrl: issue.user.avatar_url,
+      url: issue.user.html_url,
     }
+  );
+
+  const thread = await channel.threads.create({
+    name: issue.title,
+    message: syncMessage,
   });
+
+  const starterMessage = await thread.fetchStarterMessage();
+  await starterMessage.pin();
+
+  return thread;
 }
 
-// Helper function to check if a message should be synced
-function shouldSyncMessage(message, issueNumber) {
-  return message.cleanContent.includes(`\`synced with issue #${issueNumber}\``);
+async function handleNewComment(client, payload) {
+  const issue = payload.event.issue;
+  const comment = payload.event.comment;
+
+  if (isIgnoredComment(comment)) {
+    console.log("Ignoring bot comment");
+    return;
+  }
+
+  if (!hasSyncLabel(issue)) {
+    const octokit = createOctokit();
+    await octokit.rest.issues.addLabels({
+      owner: getRepoOwner(),
+      repo: getRepoName(),
+      issue_number: issue.number,
+      labels: [SYNC_LABEL],
+    });
+    console.log("Added sync label");
+    await createDiscordThread(client, payload);
+    await sleep(2000);
+  }
+
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  for (const thread of threads) {
+    console.log(`Syncing comment to issue #${issue.number}`);
+    await thread.send(createCommentEmbed(comment));
+  }
+
+  console.log("Comment sync complete");
 }
 
-// Function to create the message payload
-function createMessagePayload(comment, channel_id) {
-  return {
-    threadId: channel_id,
+async function handleNewIssue(client, payload) {
+  const octokit = createOctokit();
+  const issueNumber = payload.event.issue?.number || payload.event.number;
+
+  const { data: issue } = await octokit.rest.issues.get({
+    owner: getRepoOwner(),
+    repo: getRepoName(),
+    issue_number: issueNumber,
+  });
+
+  if (hasSyncLabel(issue)) {
+    console.log("Issue already synced");
+    return;
+  }
+
+  await octokit.rest.issues.addLabels({
+    owner: getRepoOwner(),
+    repo: getRepoName(),
+    issue_number: payload.event.issue.number,
+    labels: [SYNC_LABEL],
+  });
+
+  await createDiscordThread(client, payload);
+}
+
+async function handleIssueClosed(client, payload) {
+  const issue = payload.event.issue;
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  for (const thread of threads) {
+    if (!thread.archived) {
+      console.log(`Archiving thread for issue #${issue.number}`);
+      await thread.setArchived(true, `Issue #${issue.number} closed on GitHub`);
+    }
+  }
+
+  console.log(`Archived ${threads.length} thread(s)`);
+}
+
+async function handleIssueReopened(client, payload) {
+  const issue = payload.event.issue;
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  for (const thread of threads) {
+    if (thread.archived) {
+      console.log(`Unarchiving thread for issue #${issue.number}`);
+      await thread.setArchived(false, `Issue #${issue.number} reopened on GitHub`);
+    }
+  }
+
+  console.log(`Unarchived ${threads.length} thread(s)`);
+}
+
+async function handleIssueLabeled(client, payload) {
+  const issue = payload.event.issue;
+  const label = payload.event.label;
+
+  if (isSyncLabel(label.name)) {
+    return;
+  }
+
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  if (threads.length === 0) {
+    console.log(`No synced threads for issue #${issue.number}`);
+    return;
+  }
+
+  const forum = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+  const tag = await getOrCreateForumTag(forum, label.name);
+
+  if (!tag) {
+    return;
+  }
+
+  for (const thread of threads) {
+    const currentTags = thread.appliedTags || [];
+    if (!currentTags.includes(tag.id)) {
+      // Discord limit: 5 tags per thread
+      if (currentTags.length >= 5) {
+        console.log(`Thread at 5 tag limit, cannot add "${label.name}"`);
+        continue;
+      }
+      console.log(`Adding tag "${label.name}" to thread`);
+      await thread.setAppliedTags([...currentTags, tag.id]);
+    }
+  }
+}
+
+async function handleIssueUnlabeled(client, payload) {
+  const issue = payload.event.issue;
+  const label = payload.event.label;
+
+  if (isSyncLabel(label.name)) {
+    return;
+  }
+
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  if (threads.length === 0) {
+    return;
+  }
+
+  const forum = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+  const tag = forum.availableTags.find(
+    (t) => t.name.toLowerCase() === label.name.toLowerCase()
+  );
+
+  if (!tag) {
+    return;
+  }
+
+  for (const thread of threads) {
+    const currentTags = thread.appliedTags || [];
+    if (currentTags.includes(tag.id)) {
+      console.log(`Removing tag "${label.name}" from thread`);
+      await thread.setAppliedTags(currentTags.filter((id) => id !== tag.id));
+    }
+  }
+}
+
+async function handleIssueMilestoned(client, payload) {
+  const issue = payload.event.issue;
+  const milestone = payload.event.milestone;
+
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
+  );
+
+  if (threads.length === 0) {
+    return;
+  }
+
+  const embed = {
     embeds: [
       {
-        description: comment.body,
-        url: comment.html_url,
-        color: parseInt(getRandomColor(comment.user.login), 16),
-        author: {
-          name: comment.user.login,
-          icon_url: comment.user.avatar_url,
-          url: comment.user.html_url,
+        description: `Added to milestone **[${milestone.title}](${milestone.html_url})**`,
+        color: 0x238636,
+        footer: {
+          text: milestone.description || `${milestone.open_issues} open · ${milestone.closed_issues} closed`,
         },
       },
     ],
   };
-}
 
-function startClient(token) {
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.MessageContent,
-    ],
-  });
-  client.login(token);
-  return client;
-}
-async function process(payload) {
-  console.log(payload.event.action);
-
-  if (payload.event.action === "created") {
-    startClient(token).once(Events.ClientReady, async (client) => {
-    newComment(client, payload);
-    
-    });
-    //check if labels include "synced-with-discord"
-  }
-  if (payload.event.action === "opened") {
-    startClient(token).once(Events.ClientReady, async (client) => {
-      const octokit = new Octokit({ auth: env.GITHUB_TOKEN });
-      let labels = octokit.rest.issues
-        .get({
-          owner: env.TARGET_REPO.split("/")[0],
-          repo: env.TARGET_REPO.split("/")[1],
-          issue_number: payload.event.issue?.number || payload.event.number,
-        })
-        .then((issue) => {
-          if (
-            issue.data.labels.find(
-              (label) => label.name === "synced-with-discord"
-            )
-          ) {
-            console.log("issue already tagged as synced on github");
-
-            client.destroy();
-            return;
-          }
-          octokit.rest.issues.addLabels({
-            owner: env.TARGET_REPO.split("/")[0],
-            repo: env.TARGET_REPO.split("/")[1],
-            issue_number: payload.event.issue.number,
-            labels: ["synced-with-discord"],
-          });
-          createNewPost(client, payload);
-        });
-    });
+  for (const thread of threads) {
+    console.log(`Notifying milestone "${milestone.title}" on thread`);
+    await thread.send(embed);
   }
 }
 
-/**
- * @param {Client} client The client to use
- */
-function createNewPost(client, payload, destroyClient = true) {
-  console.log(
-    "client ready with channel " + env.DISCORD_INPUT_FORUM_CHANNEL_ID
+async function handleIssueAssigned(client, payload) {
+  const issue = payload.event.issue;
+  const assignee = payload.event.assignee;
+
+  const threads = await findThreadsForIssue(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    issue.number
   );
-  client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID).then(async (channel) => {
-    console.log(`New issue ${channel}`);
-    let newMessage = {
-      content: `\`synced with issue #${payload.event.issue.number}\` [follow on github](${payload.event.issue.html_url})`,
-      embeds: [
-        {
-          title: `#${payload.event.issue.number} ${payload.event.issue.title}`,
-          description: payload.event.issue.body,
-          url: payload.event.issue.html_url,
-          color: parseInt(getRandomColor(payload.event.issue.user.login), 16),
-          author: {
-            name: payload.event.issue.user.login,
-            icon_url: payload.event.issue.user.avatar_url,
-            url: payload.event.issue.user.html_url,
-          },
+
+  if (threads.length === 0) {
+    return;
+  }
+
+  const embed = {
+    embeds: [
+      {
+        description: `Assigned to **[${assignee.login}](${assignee.html_url})**`,
+        color: 0x1f6feb,
+        thumbnail: {
+          url: assignee.avatar_url,
         },
-      ],
-    };
-    
-    let thread = await channel.threads.create({
-      name: payload.event.issue.title,
-      message: newMessage,
-    })
-    thread.fetchStarterMessage().then((message) => {
-      message.pin();
-      if (destroyClient){
-        client.destroy();
+      },
+    ],
+  };
+
+  for (const thread of threads) {
+    console.log(`Notifying assignee "${assignee.login}" on thread`);
+    await thread.send(embed);
+  }
+}
+
+function process(payload) {
+  console.log(`Processing action: ${payload.event.action}`);
+
+  const client = createDiscordClient();
+
+  client.login(env.DISCORD_TOKEN).catch((err) => {
+    console.error("Discord login failed:", err);
+    client.destroy();
+  });
+
+  client.once(Events.ClientReady, async () => {
+    try {
+      switch (payload.event.action) {
+        case "created":
+          await handleNewComment(client, payload);
+          break;
+        case "opened":
+          await handleNewIssue(client, payload);
+          break;
+        case "closed":
+          await handleIssueClosed(client, payload);
+          break;
+        case "reopened":
+          await handleIssueReopened(client, payload);
+          break;
+        case "labeled":
+          await handleIssueLabeled(client, payload);
+          break;
+        case "unlabeled":
+          await handleIssueUnlabeled(client, payload);
+          break;
+        case "milestoned":
+          await handleIssueMilestoned(client, payload);
+          break;
+        case "assigned":
+          await handleIssueAssigned(client, payload);
+          break;
       }
-    });
+    } catch (err) {
+      console.error("Error processing payload:", err);
+    } finally {
+      client.destroy();
+    }
   });
 }
+
 module.exports = { process };
