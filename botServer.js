@@ -59,6 +59,8 @@ async function handleNewMessage(message) {
         issue_number: issueNumber,
       });
 
+      console.log(`Issue #${issueNumber} has ${issue.comments} comments`);
+
       let lastComment = null;
       if (issue.comments > 0) {
         const lastPage = Math.ceil(issue.comments / 100);
@@ -73,6 +75,7 @@ async function handleNewMessage(message) {
       }
 
       const lastCommentAuthor = lastComment ? extractDiscordUsername(lastComment.body) : null;
+      console.log(`Last author: "${lastCommentAuthor}", current: "${message.author.username}"`);
 
       if (lastComment && lastCommentAuthor === message.author.username) {
         console.log(`Appending to existing comment for ${message.author.username}`);
