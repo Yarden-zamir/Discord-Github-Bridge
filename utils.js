@@ -111,11 +111,11 @@ function createSyncEmbed(issueNumber, title, body, htmlUrl, author) {
   };
 }
 
-function createCommentEmbed(comment) {
+function createCommentEmbed(comment, processedBody = null) {
   return {
     embeds: [
       {
-        description: comment.body,
+        description: processedBody || comment.body,
         url: comment.html_url,
         color: parseInt(getRandomColor(comment.user.login), 16),
         author: {
@@ -126,6 +126,32 @@ function createCommentEmbed(comment) {
       },
     ],
   };
+}
+
+async function processGitHubIssueRefs(client, forumChannelId, content) {
+  const issueRefPattern = /#(\d+)/g;
+  const matches = [...content.matchAll(issueRefPattern)];
+
+  if (matches.length === 0) return content;
+
+  const issueToThread = new Map();
+
+  // Find threads for all referenced issues
+  for (const match of matches) {
+    const issueNumber = parseInt(match[1], 10);
+    if (issueToThread.has(issueNumber)) continue;
+
+    const threads = await findThreadsForIssue(client, forumChannelId, issueNumber);
+    if (threads.length > 0) {
+      issueToThread.set(issueNumber, threads[0].url);
+    }
+  }
+
+  // Replace issue refs with Discord thread links
+  return content.replace(issueRefPattern, (match, issueNum) => {
+    const threadUrl = issueToThread.get(parseInt(issueNum, 10));
+    return threadUrl ? `[${match}](${threadUrl})` : match;
+  });
 }
 
 function sleep(ms) {
@@ -229,6 +255,7 @@ module.exports = {
   formatDiscordAuthorComment,
   createSyncEmbed,
   createCommentEmbed,
+  processGitHubIssueRefs,
   sleep,
   findThreadsForIssue,
   getOrCreateForumTag,

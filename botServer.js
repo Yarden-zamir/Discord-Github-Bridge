@@ -33,6 +33,11 @@ function createOctokit() {
   return new Octokit({ auth: env.GITHUB_TOKEN });
 }
 
+function extractDiscordUsername(commentBody) {
+  const match = commentBody.match(/\*\*(.+?)\*\* on Discord says\]/);
+  return match ? match[1] : null;
+}
+
 async function handleNewMessage(message) {
   try {
     if (!isForumThread(message.channel)) return;
@@ -44,19 +49,47 @@ async function handleNewMessage(message) {
     if (issueNumbers.length === 0) return;
 
     const octokit = createOctokit();
-    const body = formatDiscordAuthorComment(
-      message.author,
-      message.url,
-      processMessageContent(message)
-    );
+    const newContent = processMessageContent(message);
 
     for (const issueNumber of issueNumbers) {
-      await octokit.rest.issues.createComment({
+      // Get issue to find comment count, then fetch only the last page
+      const { data: issue } = await octokit.rest.issues.get({
         owner: getRepoOwner(),
         repo: getRepoName(),
         issue_number: issueNumber,
-        body,
       });
+
+      let lastComment = null;
+      if (issue.comments > 0) {
+        const lastPage = Math.ceil(issue.comments / 100);
+        const { data: comments } = await octokit.rest.issues.listComments({
+          owner: getRepoOwner(),
+          repo: getRepoName(),
+          issue_number: issueNumber,
+          per_page: 100,
+          page: lastPage,
+        });
+        lastComment = comments.at(-1);
+      }
+
+      const lastCommentAuthor = lastComment ? extractDiscordUsername(lastComment.body) : null;
+
+      if (lastComment && lastCommentAuthor === message.author.username) {
+        console.log(`Appending to existing comment for ${message.author.username}`);
+        await octokit.rest.issues.updateComment({
+          owner: getRepoOwner(),
+          repo: getRepoName(),
+          comment_id: lastComment.id,
+          body: `${lastComment.body}\n\n[↓](${message.url})\n${newContent}`,
+        });
+      } else {
+        await octokit.rest.issues.createComment({
+          owner: getRepoOwner(),
+          repo: getRepoName(),
+          issue_number: issueNumber,
+          body: formatDiscordAuthorComment(message.author, message.url, newContent),
+        });
+      }
     }
   } catch (err) {
     console.error("Error handling new message:", err);

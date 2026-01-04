@@ -5,6 +5,7 @@ const {
   createDiscordClient,
   createSyncEmbed,
   createCommentEmbed,
+  processGitHubIssueRefs,
   hasSyncLabel,
   isSyncLabel,
   getRepoOwner,
@@ -45,9 +46,19 @@ async function createDiscordThread(client, payload) {
     }
   );
 
+  // Collect tag IDs for issue labels (excluding sync label)
+  const tagIds = [];
+  const labels = (issue.labels || []).filter((l) => !isSyncLabel(l.name));
+  for (const label of labels) {
+    const tag = await getOrCreateForumTag(channel, label.name);
+    if (tag) tagIds.push(tag.id);
+    if (tagIds.length >= 5) break; // Discord limit
+  }
+
   const thread = await channel.threads.create({
     name: issue.title,
     message: syncMessage,
+    appliedTags: tagIds,
   });
 
   const starterMessage = await thread.fetchStarterMessage();
@@ -84,9 +95,16 @@ async function handleNewComment(client, payload) {
     issue.number
   );
 
+  // Process issue references to Discord thread links
+  const processedBody = await processGitHubIssueRefs(
+    client,
+    env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+    comment.body
+  );
+
   for (const thread of threads) {
     console.log(`Syncing comment to issue #${issue.number}`);
-    await thread.send(createCommentEmbed(comment));
+    await thread.send(createCommentEmbed(comment, processedBody));
   }
 
   console.log("Comment sync complete");
