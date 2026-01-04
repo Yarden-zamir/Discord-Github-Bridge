@@ -83,7 +83,7 @@ async function handleNewMessage(message) {
           owner: getRepoOwner(),
           repo: getRepoName(),
           comment_id: lastComment.id,
-          body: `${lastComment.body}\n\n[↓](${message.url})\n${newContent}`,
+          body: `${lastComment.body}\n${newContent}`,
         });
       } else {
         await octokit.rest.issues.createComment({
