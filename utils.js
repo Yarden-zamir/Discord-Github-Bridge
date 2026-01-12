@@ -10,12 +10,22 @@ const DISCORD_INTENTS = [
 
 const SYNC_LABEL = "🔵-synced";
 
+let currentRepo = null;
+
+function setTargetRepo(repo) {
+  currentRepo = repo;
+}
+
+function getTargetRepo() {
+  return currentRepo || env.TARGET_REPO;
+}
+
 function getRepoOwner() {
-  return env.TARGET_REPO.split("/")[0];
+  return getTargetRepo().split("/")[0];
 }
 
 function getRepoName() {
-  return env.TARGET_REPO.split("/")[1];
+  return getTargetRepo().split("/")[1];
 }
 
 function getRandomColor(seedString) {
@@ -69,18 +79,48 @@ function processMessageContent(message) {
   return content;
 }
 
-async function getSyncedIssueNumbers(channel) {
+async function getSyncedIssueInfo(channel) {
   const pinnedMessages = await channel.messages.fetchPinned();
-  const issueNumbers = [];
+  const issues = [];
 
   pinnedMessages.forEach((message) => {
-    const match = message.cleanContent.match(/`synced with issue #(\d+)`/);
-    if (match) {
-      issueNumbers.push(parseInt(match[1], 10));
+    console.log("Pinned message content:", message.content);
+
+    // Current format: `Synced with issue #N` on [repo-name](https://github.com/owner/repo)
+    // Extract issue number and owner/repo from URL
+    const currentMatch = message.content.match(/`Synced with issue #(\d+)`.*on \[.+?\]\(https:\/\/github\.com\/([^/]+)\/([^/)]+)/);
+    if (currentMatch) {
+      console.log("Matched current format:", { number: currentMatch[1], owner: currentMatch[2], repo: currentMatch[3] });
+      issues.push({
+        number: parseInt(currentMatch[1], 10),
+        owner: currentMatch[2],
+        repo: currentMatch[3],
+      });
+      return;
+    }
+
+    // Old format: `synced with issue #N` (backwards compat)
+    // Extract owner/repo from the GitHub issue URL in the message
+    const oldMatch = message.content.match(/`synced with issue #(\d+)`/i);
+    if (oldMatch) {
+      const urlMatch = message.content.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+/);
+      console.log("Matched old format:", { number: oldMatch[1], urlMatch });
+      issues.push({
+        number: parseInt(oldMatch[1], 10),
+        owner: urlMatch ? urlMatch[1] : null,
+        repo: urlMatch ? urlMatch[2] : null,
+      });
     }
   });
 
-  return issueNumbers;
+  console.log("Synced issues found:", issues);
+  return issues;
+}
+
+// Backwards compat wrapper
+async function getSyncedIssueNumbers(channel) {
+  const issues = await getSyncedIssueInfo(channel);
+  return issues.map((i) => i.number);
 }
 
 function hasSyncLabel(issue) {
@@ -92,9 +132,14 @@ function formatDiscordAuthorComment(author, messageUrl, content) {
   return `[<img src="${avatarUrl}" width="15" height="15"/> **${author.username}** on Discord says](${messageUrl})\n${content}`;
 }
 
-function createSyncEmbed(issueNumber, title, body, htmlUrl, author) {
+function createSyncEmbed(issueNumber, title, body, htmlUrl, author, repoName) {
+  // Extract owner from issue URL: https://github.com/owner/repo/issues/N
+  const urlMatch = htmlUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+  const owner = urlMatch ? urlMatch[1] : '';
+  const repoUrl = `https://github.com/${owner}/${repoName}`;
+
   return {
-    content: `\`synced with issue #${issueNumber}\` [follow on github](${htmlUrl})`,
+    content: `\`Synced with issue #${issueNumber}\` on [${repoName}](${repoUrl}) · [follow on github](${htmlUrl})`,
     embeds: [
       {
         title: `#${issueNumber} ${title}`,
@@ -128,7 +173,7 @@ function createCommentEmbed(comment, processedBody = null) {
   };
 }
 
-async function processGitHubIssueRefs(client, forumChannelId, content) {
+async function processGitHubIssueRefs(client, forumChannelId, content, owner = null, repo = null) {
   const issueRefPattern = /#(\d+)/g;
   const matches = [...content.matchAll(issueRefPattern)];
 
@@ -141,7 +186,7 @@ async function processGitHubIssueRefs(client, forumChannelId, content) {
     const issueNumber = parseInt(match[1], 10);
     if (issueToThread.has(issueNumber)) continue;
 
-    const threads = await findThreadsForIssue(client, forumChannelId, issueNumber);
+    const threads = await findThreadsForIssue(client, forumChannelId, issueNumber, owner, repo);
     if (threads.length > 0) {
       issueToThread.set(issueNumber, threads[0].url);
     }
@@ -186,7 +231,7 @@ async function getOrCreateForumTag(forum, tagName) {
 
 async function getOrCreateGitHubLabel(octokit, labelName) {
   try {
-    await octokit.rest.issues.getLabel({
+    await octokit.request("GET /repos/{owner}/{repo}/labels/{name}", {
       owner: getRepoOwner(),
       repo: getRepoName(),
       name: labelName,
@@ -195,7 +240,7 @@ async function getOrCreateGitHubLabel(octokit, labelName) {
   } catch (err) {
     if (err.status === 404) {
       console.log(`Creating GitHub label: ${labelName}`);
-      await octokit.rest.issues.createLabel({
+      await octokit.request("POST /repos/{owner}/{repo}/labels", {
         owner: getRepoOwner(),
         repo: getRepoName(),
         name: labelName,
@@ -206,7 +251,7 @@ async function getOrCreateGitHubLabel(octokit, labelName) {
   }
 }
 
-async function findThreadsForIssue(client, forumChannelId, issueNumber) {
+async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = null, repo = null) {
   const threads = [];
   const forum = await client.channels.fetch(forumChannelId);
 
@@ -231,9 +276,35 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber) {
   for (const thread of allThreads) {
     const pinnedMessages = await thread.messages.fetchPinned();
     for (const [, message] of pinnedMessages) {
-      if (message.cleanContent.includes(`\`synced with issue #${issueNumber}\``)) {
-        threads.push(thread);
-        break;
+      // Parse synced issue info from pinned message
+      const content = message.content;
+
+      // Current format: `Synced with issue #N` on [repo-name](https://github.com/owner/repo)
+      const currentMatch = content.match(/`Synced with issue #(\d+)`.*on \[.+?\]\(https:\/\/github\.com\/([^/]+)\/([^/)]+)/);
+      if (currentMatch) {
+        const msgIssueNum = parseInt(currentMatch[1], 10);
+        const msgOwner = currentMatch[2];
+        const msgRepo = currentMatch[3];
+
+        if (msgIssueNum === issueNumber && (!owner || !repo || (msgOwner === owner && msgRepo === repo))) {
+          threads.push(thread);
+          break;
+        }
+        continue;
+      }
+
+      // Old format: `synced with issue #N` (backwards compat)
+      const oldMatch = content.match(/`synced with issue #(\d+)`/i);
+      if (oldMatch) {
+        const msgIssueNum = parseInt(oldMatch[1], 10);
+        const urlMatch = content.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+/);
+        const msgOwner = urlMatch ? urlMatch[1] : null;
+        const msgRepo = urlMatch ? urlMatch[2] : null;
+
+        if (msgIssueNum === issueNumber && (!owner || !repo || !msgOwner || !msgRepo || (msgOwner === owner && msgRepo === repo))) {
+          threads.push(thread);
+          break;
+        }
       }
     }
   }
@@ -243,12 +314,15 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber) {
 
 module.exports = {
   SYNC_LABEL,
+  setTargetRepo,
+  getTargetRepo,
   getRepoOwner,
   getRepoName,
   getRandomColor,
   createDiscordClient,
   isForumThread,
   processMessageContent,
+  getSyncedIssueInfo,
   getSyncedIssueNumbers,
   hasSyncLabel,
   isSyncLabel,
