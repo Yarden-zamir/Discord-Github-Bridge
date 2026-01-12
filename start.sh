@@ -9,5 +9,4 @@ git pull
 echo "Building and starting containers..."
 docker compose up -d --build
 
-echo "Done. Checking status..."
-docker compose ps
+docker compose logs -f
