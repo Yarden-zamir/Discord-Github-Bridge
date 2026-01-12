@@ -1,0 +1,3 @@
+discord-github-bridge.yarden-zamir.com {
+    reverse_proxy bot:8080
+}
