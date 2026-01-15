@@ -393,8 +393,50 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
     }
   }
 
+  const PIN_FETCH_TIMEOUT_MS = 20000;
+  const fetchPinnedWithTimeout = async (thread) => {
+    const timeoutError = new Error("Pinned fetch timeout");
+    timeoutError.code = "PIN_FETCH_TIMEOUT";
+    return Promise.race([
+      thread.messages.fetchPinned(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(timeoutError), PIN_FETCH_TIMEOUT_MS)
+      ),
+    ]);
+  };
+
   for (const thread of allThreads) {
-    const pinnedMessages = await thread.messages.fetchPinned();
+    logEvent("info", "discord.thread.search.pin.start", {
+      forumId: forumChannelId,
+      issueNumber,
+      threadId: thread.id,
+      archived: thread.archived,
+    });
+
+    let pinnedMessages;
+    try {
+      pinnedMessages = await fetchPinnedWithTimeout(thread);
+    } catch (err) {
+      if (err.code === "PIN_FETCH_TIMEOUT") {
+        logEvent("warn", "discord.thread.search.pin.timeout", {
+          forumId: forumChannelId,
+          issueNumber,
+          threadId: thread.id,
+          archived: thread.archived,
+          timeoutMs: PIN_FETCH_TIMEOUT_MS,
+        });
+        continue;
+      }
+      logEvent("error", "discord.thread.search.pin.error", {
+        forumId: forumChannelId,
+        issueNumber,
+        threadId: thread.id,
+        archived: thread.archived,
+        error: formatError(err),
+      });
+      continue;
+    }
+
     for (const [, message] of pinnedMessages) {
       // Parse synced issue info from pinned message
       const content = message.content;
