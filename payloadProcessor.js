@@ -131,7 +131,7 @@ async function createDiscordThread(client, issue, owner, repoName) {
 function createIssueStatusEmbed(issue, action, actor) {
   const isClosed = action === "closed";
   const title = isClosed ? "Issue closed" : "Issue reopened";
-  const color = isClosed ? 0xda3633 : 0x238636;
+  const color = isClosed ? 0x6f42c1 : 0x238636;
   const actorLine = actor ? `${isClosed ? "Closed" : "Reopened"} by **${actor}**` : "Updated on GitHub";
   return {
     embeds: [
