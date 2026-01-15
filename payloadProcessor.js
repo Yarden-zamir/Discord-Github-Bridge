@@ -7,14 +7,25 @@ const {
   processGitHubIssueRefs,
   hasSyncLabel,
   isSyncLabel,
-  getRepoOwner,
-  getRepoName,
   SYNC_LABEL,
   sleep,
   findThreadsForIssue,
   getOrCreateForumTag,
-  setTargetRepo,
+  REPO_TAG_EMOJI,
+  logEvent,
+  formatError,
 } = require("./utils.js");
+
+function getRepoInfo(repository) {
+  const fullName = repository?.full_name || "";
+  const [ownerFromFull, repoFromFull] = fullName.split("/");
+  const owner = repository?.owner?.login || ownerFromFull;
+  const repo = repository?.name || repoFromFull;
+  if (!owner || !repo) {
+    throw new Error("Repository info missing in webhook payload");
+  }
+  return { owner, repo, fullName: `${owner}/${repo}` };
+}
 
 function isIgnoredComment(comment) {
   return (
@@ -28,7 +39,7 @@ async function withDiscordClient(fn) {
 
   return new Promise((resolve, reject) => {
     client.login(env.DISCORD_TOKEN).catch((err) => {
-      console.error("Discord login failed:", err);
+      logEvent("error", "discord.login.failed", { error: formatError(err) });
       client.destroy();
       reject(err);
     });
@@ -38,7 +49,7 @@ async function withDiscordClient(fn) {
         await fn(client);
         resolve();
       } catch (err) {
-        console.error("Error in Discord handler:", err);
+        logEvent("error", "discord.handler.error", { error: formatError(err) });
         reject(err);
       } finally {
         client.destroy();
@@ -47,11 +58,13 @@ async function withDiscordClient(fn) {
   });
 }
 
-async function createDiscordThread(client, issue, octokit) {
+async function createDiscordThread(client, issue, repoName) {
   const channel = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
-  const repoName = getRepoName();
 
-  console.log(`Creating thread for issue #${issue.number}`);
+  logEvent("info", "discord.thread.create", {
+    issueNumber: issue.number,
+    repo: repoName,
+  });
 
   const syncMessage = createSyncEmbed(
     issue.number,
@@ -69,7 +82,7 @@ async function createDiscordThread(client, issue, octokit) {
   const tagIds = [];
 
   // Add repo tag first (just repo name, no org)
-  const repoTag = await getOrCreateForumTag(channel, repoName);
+  const repoTag = await getOrCreateForumTag(channel, repoName, REPO_TAG_EMOJI);
   if (repoTag) tagIds.push(repoTag.id);
 
   // Add label tags
@@ -92,29 +105,51 @@ async function createDiscordThread(client, issue, octokit) {
   return thread;
 }
 
-async function handleIssueComment({ octokit, payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issue_comment from ${repo}`);
-
+async function handleIssueComment({ octokit, payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
   const comment = payload.comment;
 
+  logEvent("info", "github.issue_comment.received", {
+    repo: fullName,
+    issueNumber: issue.number,
+    commentId: comment.id,
+    installationId,
+  });
+
+  if (!octokit) {
+    logEvent("error", "github.octokit.missing", {
+      repo: fullName,
+      installationId,
+      event: "issue_comment",
+    });
+    return;
+  }
+
   if (isIgnoredComment(comment)) {
-    console.log("Ignoring bot comment");
+    logEvent("info", "github.issue_comment.ignored", {
+      repo: fullName,
+      issueNumber: issue.number,
+      commentId: comment.id,
+    });
     return;
   }
 
   await withDiscordClient(async (client) => {
     if (!hasSyncLabel(issue)) {
       await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/labels", {
-        owner: getRepoOwner(),
-        repo: getRepoName(),
+        owner,
+        repo,
         issue_number: issue.number,
         labels: [SYNC_LABEL],
       });
-      console.log("Added sync label");
-      await createDiscordThread(client, issue, octokit);
+      logEvent("info", "github.issue.label.added", {
+        repo: fullName,
+        issueNumber: issue.number,
+        label: SYNC_LABEL,
+        installationId,
+      });
+      await createDiscordThread(client, issue, repo);
       await sleep(2000);
     }
 
@@ -122,116 +157,177 @@ async function handleIssueComment({ octokit, payload }) {
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     const processedBody = await processGitHubIssueRefs(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       comment.body,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     for (const thread of threads) {
-      console.log(`Syncing comment to issue #${issue.number}`);
+      logEvent("info", "discord.comment.sync", {
+        repo: fullName,
+        issueNumber: issue.number,
+        threadId: thread.id,
+        installationId,
+      });
       await thread.send(createCommentEmbed(comment, processedBody));
     }
 
-    console.log("Comment sync complete");
+    logEvent("info", "discord.comment.sync.complete", {
+      repo: fullName,
+      issueNumber: issue.number,
+      threadCount: threads.length,
+      installationId,
+    });
   });
 }
 
-async function handleIssueOpened({ octokit, payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.opened from ${repo}`);
-
+async function handleIssueOpened({ octokit, payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
 
+  logEvent("info", "github.issue.opened", {
+    repo: fullName,
+    issueNumber: issue.number,
+    installationId,
+  });
+
+  if (!octokit) {
+    logEvent("error", "github.octokit.missing", {
+      repo: fullName,
+      installationId,
+      event: "issues.opened",
+    });
+    return;
+  }
+
   if (hasSyncLabel(issue)) {
-    console.log("Issue already synced");
+    logEvent("info", "github.issue.already_synced", {
+      repo: fullName,
+      issueNumber: issue.number,
+      installationId,
+    });
     return;
   }
 
   await withDiscordClient(async (client) => {
     await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/labels", {
-      owner: getRepoOwner(),
-      repo: getRepoName(),
+      owner,
+      repo,
       issue_number: issue.number,
       labels: [SYNC_LABEL],
     });
+    logEvent("info", "github.issue.label.added", {
+      repo: fullName,
+      issueNumber: issue.number,
+      label: SYNC_LABEL,
+      installationId,
+    });
 
-    await createDiscordThread(client, issue, octokit);
+    await createDiscordThread(client, issue, repo);
   });
 }
 
-async function handleIssueClosed({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.closed from ${repo}`);
-
+async function handleIssueClosed({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
+
+  logEvent("info", "github.issue.closed", {
+    repo: fullName,
+    issueNumber: issue.number,
+    installationId,
+  });
 
   await withDiscordClient(async (client) => {
     const threads = await findThreadsForIssue(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     for (const thread of threads) {
       if (!thread.archived) {
-        console.log(`Archiving thread for issue #${issue.number}`);
+        logEvent("info", "discord.thread.archive", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          installationId,
+        });
         await thread.setArchived(true, `Issue #${issue.number} closed on GitHub`);
       }
     }
 
-    console.log(`Archived ${threads.length} thread(s)`);
+    logEvent("info", "discord.thread.archive.complete", {
+      repo: fullName,
+      issueNumber: issue.number,
+      threadCount: threads.length,
+      installationId,
+    });
   });
 }
 
-async function handleIssueReopened({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.reopened from ${repo}`);
-
+async function handleIssueReopened({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
+
+  logEvent("info", "github.issue.reopened", {
+    repo: fullName,
+    issueNumber: issue.number,
+    installationId,
+  });
 
   await withDiscordClient(async (client) => {
     const threads = await findThreadsForIssue(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     for (const thread of threads) {
       if (thread.archived) {
-        console.log(`Unarchiving thread for issue #${issue.number}`);
+        logEvent("info", "discord.thread.unarchive", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          installationId,
+        });
         await thread.setArchived(false, `Issue #${issue.number} reopened on GitHub`);
       }
     }
 
-    console.log(`Unarchived ${threads.length} thread(s)`);
+    logEvent("info", "discord.thread.unarchive.complete", {
+      repo: fullName,
+      issueNumber: issue.number,
+      threadCount: threads.length,
+      installationId,
+    });
   });
 }
 
-async function handleIssueLabeled({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.labeled from ${repo}`);
-
+async function handleIssueLabeled({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
   const label = payload.label;
-  const repoName = getRepoName();
+
+  logEvent("info", "github.issue.labeled", {
+    repo: fullName,
+    issueNumber: issue.number,
+    label: label.name,
+    installationId,
+  });
 
   // Skip sync label and repo name tags
-  if (isSyncLabel(label.name) || label.name === repoName) {
+  if (isSyncLabel(label.name) || label.name === repo) {
     return;
   }
 
@@ -240,12 +336,16 @@ async function handleIssueLabeled({ payload }) {
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     if (threads.length === 0) {
-      console.log(`No synced threads for issue #${issue.number}`);
+      logEvent("info", "discord.thread.missing", {
+        repo: fullName,
+        issueNumber: issue.number,
+        installationId,
+      });
       return;
     }
 
@@ -260,27 +360,42 @@ async function handleIssueLabeled({ payload }) {
       const currentTags = thread.appliedTags || [];
       if (!currentTags.includes(tag.id)) {
         if (currentTags.length >= 5) {
-          console.log(`Thread at 5 tag limit, cannot add "${label.name}"`);
+          logEvent("warn", "discord.thread.tag.limit", {
+            repo: fullName,
+            issueNumber: issue.number,
+            threadId: thread.id,
+            label: label.name,
+            installationId,
+          });
           continue;
         }
-        console.log(`Adding tag "${label.name}" to thread`);
+        logEvent("info", "discord.thread.tag.add", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          label: label.name,
+          installationId,
+        });
         await thread.setAppliedTags([...currentTags, tag.id]);
       }
     }
   });
 }
 
-async function handleIssueUnlabeled({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.unlabeled from ${repo}`);
-
+async function handleIssueUnlabeled({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
   const label = payload.label;
-  const repoName = getRepoName();
+
+  logEvent("info", "github.issue.unlabeled", {
+    repo: fullName,
+    issueNumber: issue.number,
+    label: label.name,
+    installationId,
+  });
 
   // Skip sync label and repo name tags
-  if (isSyncLabel(label.name) || label.name === repoName) {
+  if (isSyncLabel(label.name) || label.name === repo) {
     return;
   }
 
@@ -289,8 +404,8 @@ async function handleIssueUnlabeled({ payload }) {
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     if (threads.length === 0) {
@@ -309,28 +424,38 @@ async function handleIssueUnlabeled({ payload }) {
     for (const thread of threads) {
       const currentTags = thread.appliedTags || [];
       if (currentTags.includes(tag.id)) {
-        console.log(`Removing tag "${label.name}" from thread`);
+        logEvent("info", "discord.thread.tag.remove", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          label: label.name,
+          installationId,
+        });
         await thread.setAppliedTags(currentTags.filter((id) => id !== tag.id));
       }
     }
   });
 }
 
-async function handleIssueMilestoned({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.milestoned from ${repo}`);
-
+async function handleIssueMilestoned({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
   const milestone = payload.milestone;
+
+  logEvent("info", "github.issue.milestoned", {
+    repo: fullName,
+    issueNumber: issue.number,
+    milestone: milestone.title,
+    installationId,
+  });
 
   await withDiscordClient(async (client) => {
     const threads = await findThreadsForIssue(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     if (threads.length === 0) {
@@ -350,27 +475,37 @@ async function handleIssueMilestoned({ payload }) {
     };
 
     for (const thread of threads) {
-      console.log(`Notifying milestone "${milestone.title}" on thread`);
+      logEvent("info", "discord.thread.milestoned", {
+        repo: fullName,
+        issueNumber: issue.number,
+        threadId: thread.id,
+        milestone: milestone.title,
+        installationId,
+      });
       await thread.send(embed);
     }
   });
 }
 
-async function handleIssueAssigned({ payload }) {
-  const repo = payload.repository.full_name;
-  setTargetRepo(repo);
-  console.log(`Processing issues.assigned from ${repo}`);
-
+async function handleIssueAssigned({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
   const issue = payload.issue;
   const assignee = payload.assignee;
+
+  logEvent("info", "github.issue.assigned", {
+    repo: fullName,
+    issueNumber: issue.number,
+    assignee: assignee.login,
+    installationId,
+  });
 
   await withDiscordClient(async (client) => {
     const threads = await findThreadsForIssue(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
-      getRepoOwner(),
-      getRepoName()
+      owner,
+      repo
     );
 
     if (threads.length === 0) {
@@ -390,7 +525,13 @@ async function handleIssueAssigned({ payload }) {
     };
 
     for (const thread of threads) {
-      console.log(`Notifying assignee "${assignee.login}" on thread`);
+      logEvent("info", "discord.thread.assigned", {
+        repo: fullName,
+        issueNumber: issue.number,
+        threadId: thread.id,
+        assignee: assignee.login,
+        installationId,
+      });
       await thread.send(embed);
     }
   });

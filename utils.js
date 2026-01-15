@@ -9,23 +9,59 @@ const DISCORD_INTENTS = [
 ];
 
 const SYNC_LABEL = "🔵-synced";
+const REPO_TAG_EMOJI = env.REPO_TAG_EMOJI || "🧭";
 
-let currentRepo = null;
+function logEvent(level, event, meta = {}) {
+  const payload = { time: new Date().toISOString(), level, event, ...meta };
+  const output = JSON.stringify(payload);
+  if (level === "error") {
+    console.error(output);
+  } else if (level === "warn") {
+    console.warn(output);
+  } else {
+    console.log(output);
+  }
+}
 
-function setTargetRepo(repo) {
-  currentRepo = repo;
+function formatError(err) {
+  if (!err) return null;
+  return {
+    name: err.name,
+    message: err.message,
+    status: err.status,
+    stack: err.stack,
+    requestUrl: err.request?.url,
+    responseStatus: err.response?.status,
+  };
+}
+
+function getTagEmojiName(tag) {
+  if (!tag) return null;
+  if (typeof tag.emoji === "string") return tag.emoji;
+  return tag.emoji?.name || null;
 }
 
 function getTargetRepo() {
-  return currentRepo || env.TARGET_REPO;
+  if (!env.TARGET_REPO) {
+    throw new Error("TARGET_REPO env var not set");
+  }
+  return env.TARGET_REPO;
+}
+
+function getDefaultRepo() {
+  const [owner, repo] = getTargetRepo().split("/");
+  if (!owner || !repo) {
+    throw new Error("TARGET_REPO must be in owner/repo format");
+  }
+  return { owner, repo };
 }
 
 function getRepoOwner() {
-  return getTargetRepo().split("/")[0];
+  return getDefaultRepo().owner;
 }
 
 function getRepoName() {
-  return getTargetRepo().split("/")[1];
+  return getDefaultRepo().repo;
 }
 
 function getRandomColor(seedString) {
@@ -84,13 +120,18 @@ async function getSyncedIssueInfo(channel) {
   const issues = [];
 
   pinnedMessages.forEach((message) => {
-    console.log("Pinned message content:", message.content);
+    logEvent("info", "discord.pin.read", { channelId: channel.id, content: message.content });
 
     // Current format: `Synced with issue #N` on [repo-name](https://github.com/owner/repo)
     // Extract issue number and owner/repo from URL
     const currentMatch = message.content.match(/`Synced with issue #(\d+)`.*on \[.+?\]\(https:\/\/github\.com\/([^/]+)\/([^/)]+)/);
     if (currentMatch) {
-      console.log("Matched current format:", { number: currentMatch[1], owner: currentMatch[2], repo: currentMatch[3] });
+      logEvent("info", "discord.pin.match.current", {
+        channelId: channel.id,
+        issueNumber: parseInt(currentMatch[1], 10),
+        owner: currentMatch[2],
+        repo: currentMatch[3],
+      });
       issues.push({
         number: parseInt(currentMatch[1], 10),
         owner: currentMatch[2],
@@ -104,7 +145,11 @@ async function getSyncedIssueInfo(channel) {
     const oldMatch = message.content.match(/`synced with issue #(\d+)`/i);
     if (oldMatch) {
       const urlMatch = message.content.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+/);
-      console.log("Matched old format:", { number: oldMatch[1], urlMatch });
+      logEvent("info", "discord.pin.match.legacy", {
+        channelId: channel.id,
+        issueNumber: parseInt(oldMatch[1], 10),
+        urlMatch,
+      });
       issues.push({
         number: parseInt(oldMatch[1], 10),
         owner: urlMatch ? urlMatch[1] : null,
@@ -113,7 +158,11 @@ async function getSyncedIssueInfo(channel) {
     }
   });
 
-  console.log("Synced issues found:", issues);
+  logEvent("info", "discord.pin.synced_issues", {
+    channelId: channel.id,
+    count: issues.length,
+    issues,
+  });
   return issues;
 }
 
@@ -207,20 +256,56 @@ function isSyncLabel(labelName) {
   return labelName === SYNC_LABEL;
 }
 
-async function getOrCreateForumTag(forum, tagName) {
+async function getOrCreateForumTag(forum, tagName, emoji = null) {
   const existingTag = forum.availableTags.find(
     (t) => t.name.toLowerCase() === tagName.toLowerCase()
   );
-  if (existingTag) return existingTag;
+  if (existingTag) {
+    if (emoji && getTagEmojiName(existingTag) !== emoji) {
+      logEvent("info", "discord.forum.tag.emoji.update", {
+        forumId: forum.id,
+        tagName,
+        emoji,
+      });
+      const updatedTags = forum.availableTags.map((tag) => {
+        const tagData = {
+          id: tag.id,
+          name: tag.name,
+          moderated: tag.moderated,
+        };
+        if (tag.emoji) {
+          tagData.emoji = tag.emoji;
+        }
+        if (tag.id === existingTag.id) {
+          tagData.emoji = emoji;
+        }
+        return tagData;
+      });
+      await forum.setAvailableTags(updatedTags);
+      const updatedForum = await forum.fetch();
+      return updatedForum.availableTags.find(
+        (t) => t.name.toLowerCase() === tagName.toLowerCase()
+      );
+    }
+    return existingTag;
+  }
 
   // Create new tag (Discord limit: 20 tags per forum)
   if (forum.availableTags.length >= 20) {
-    console.log(`Cannot create tag "${tagName}" - forum at 20 tag limit`);
+    logEvent("warn", "discord.forum.tag.limit", {
+      forumId: forum.id,
+      tagName,
+      limit: 20,
+    });
     return null;
   }
 
-  console.log(`Creating forum tag: ${tagName}`);
-  await forum.setAvailableTags([...forum.availableTags, { name: tagName }]);
+  logEvent("info", "discord.forum.tag.create", { forumId: forum.id, tagName, emoji });
+  const newTag = { name: tagName };
+  if (emoji) {
+    newTag.emoji = emoji;
+  }
+  await forum.setAvailableTags([...forum.availableTags, newTag]);
 
   // Refetch to get the new tag with ID
   const updatedForum = await forum.fetch();
@@ -229,20 +314,24 @@ async function getOrCreateForumTag(forum, tagName) {
   );
 }
 
-async function getOrCreateGitHubLabel(octokit, labelName) {
+async function getOrCreateGitHubLabel(octokit, owner, repo, labelName) {
+  if (!owner || !repo) {
+    throw new Error("owner and repo are required to manage labels");
+  }
+
   try {
     await octokit.request("GET /repos/{owner}/{repo}/labels/{name}", {
-      owner: getRepoOwner(),
-      repo: getRepoName(),
+      owner,
+      repo,
       name: labelName,
     });
     return labelName;
   } catch (err) {
     if (err.status === 404) {
-      console.log(`Creating GitHub label: ${labelName}`);
+      logEvent("info", "github.label.create", { owner, repo, labelName });
       await octokit.request("POST /repos/{owner}/{repo}/labels", {
-        owner: getRepoOwner(),
-        repo: getRepoName(),
+        owner,
+        repo,
         name: labelName,
       });
       return labelName;
@@ -314,8 +403,10 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
 
 module.exports = {
   SYNC_LABEL,
-  setTargetRepo,
-  getTargetRepo,
+  REPO_TAG_EMOJI,
+  logEvent,
+  formatError,
+  getDefaultRepo,
   getRepoOwner,
   getRepoName,
   getRandomColor,

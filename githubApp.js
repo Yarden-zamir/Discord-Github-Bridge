@@ -1,6 +1,7 @@
 const { App } = require("@octokit/app");
 const { Webhooks, createNodeMiddleware } = require("@octokit/webhooks");
 const { env } = require("process");
+const { logEvent } = require("./utils.js");
 
 let app = null;
 let webhooks = null;
@@ -18,7 +19,7 @@ function getApp() {
       ? env.GITHUB_APP_PRIVATE_KEY
       : require("fs").readFileSync(env.GITHUB_APP_PRIVATE_KEY, "utf8");
 
-    console.log("Initializing GitHub App with ID:", env.GITHUB_APP_ID);
+    logEvent("info", "github.app.init", { appId: env.GITHUB_APP_ID });
 
     app = new App({
       appId: env.GITHUB_APP_ID,
