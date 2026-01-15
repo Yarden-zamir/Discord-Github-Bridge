@@ -12,9 +12,13 @@ const {
   SYNC_LABEL,
   REPO_TAG_EMOJI,
   isSyncLabel,
+  isRepoSelectorTag,
+  isClosedTag,
   sleep,
   getOrCreateGitHubLabel,
   getOrCreateForumTag,
+  getOrCreateClosedForumTag,
+  setThreadCacheEntry,
   logEvent,
   formatError,
 } = require("./utils.js");
@@ -24,6 +28,7 @@ const {
   handleIssueOpened,
   handleIssueClosed,
   handleIssueReopened,
+  handleIssueEdited,
   handleIssueLabeled,
   handleIssueUnlabeled,
   handleIssueMilestoned,
@@ -57,15 +62,6 @@ async function getOctokit() {
 const INSTALLATION_REPO_TTL_MS = 5 * 60 * 1000;
 const installationRepoCache = new Map();
 
-function getTagEmojiName(tag) {
-  if (!tag) return null;
-  if (typeof tag.emoji === "string") return tag.emoji;
-  return tag.emoji?.name || null;
-}
-
-function isRepoSelectorTag(tag) {
-  return getTagEmojiName(tag) === REPO_TAG_EMOJI;
-}
 
 async function listInstallationRepos(octokit) {
   const repos = [];
@@ -171,6 +167,7 @@ async function setupWebhooks() {
   webhooks.on("issues.opened", wrapHandler(handleIssueOpened, "issues.opened"));
   webhooks.on("issues.closed", wrapHandler(handleIssueClosed, "issues.closed"));
   webhooks.on("issues.reopened", wrapHandler(handleIssueReopened, "issues.reopened"));
+  webhooks.on("issues.edited", wrapHandler(handleIssueEdited, "issues.edited"));
   webhooks.on("issues.labeled", wrapHandler(handleIssueLabeled, "issues.labeled"));
   webhooks.on("issues.unlabeled", wrapHandler(handleIssueUnlabeled, "issues.unlabeled"));
   webhooks.on("issues.milestoned", wrapHandler(handleIssueMilestoned, "issues.milestoned"));
@@ -341,31 +338,47 @@ async function handleThreadUpdate(oldThread, newThread) {
     const octokit = await getOctokit();
     const defaultRepo = getDefaultRepo();
 
-    // Handle archive state change
-    if (oldThread.archived !== newThread.archived) {
-      const state = newThread.archived ? "closed" : "open";
+    if (oldThread.name !== newThread.name) {
       for (const { number: issueNumber, owner: issueOwner, repo: repoName } of syncedIssues) {
         const owner = issueOwner || defaultRepo.owner;
         const repo = repoName || defaultRepo.repo;
 
-        logEvent("info", "github.issue.state.update", {
-          repo: `${owner}/${repo}`,
-          issueNumber,
-          state,
-          installationId: lastInstallationId,
-        });
-        await octokit.request("PATCH /repos/{owner}/{repo}/issues/{issue_number}", {
-          owner,
-          repo,
-          issue_number: issueNumber,
-          state,
+        const { data: issueData } = await octokit.request(
+          "GET /repos/{owner}/{repo}/issues/{issue_number}",
+          {
+            owner,
+            repo,
+            issue_number: issueNumber,
+          }
+        );
+
+        if (issueData.title !== newThread.name) {
+          logEvent("info", "github.issue.rename", {
+            repo: `${owner}/${repo}`,
+            issueNumber,
+            oldTitle: issueData.title,
+            newTitle: newThread.name,
+            installationId: lastInstallationId,
+          });
+          await octokit.request("PATCH /repos/{owner}/{repo}/issues/{issue_number}", {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            title: newThread.name,
+          });
+        }
+
+        await setThreadCacheEntry(owner, repo, issueNumber, {
+          threadId: newThread.id,
+          title: newThread.name,
         });
       }
     }
 
-    // Handle tag changes (sync to GitHub labels, skip repo tags)
+    // Handle tag changes
     const oldTags = oldThread.appliedTags || [];
     const newTags = newThread.appliedTags || [];
+
 
     if (JSON.stringify([...oldTags].sort()) === JSON.stringify([...newTags].sort())) return;
 
@@ -386,15 +399,52 @@ async function handleThreadUpdate(oldThread, newThread) {
     }
 
     const isRepoNameTag = (name) => syncedRepoNames.has(name.toLowerCase());
+    const closedTagAdded = addedTagIds.some((id) => isClosedTag(tagMap.get(id)));
+    const closedTagRemoved = removedTagIds.some((id) => isClosedTag(tagMap.get(id)));
 
     for (const { number: issueNumber, owner: issueOwner, repo: repoName } of syncedIssues) {
       const owner = issueOwner || defaultRepo.owner;
       const repo = repoName || defaultRepo.repo;
 
+      if (closedTagAdded || closedTagRemoved) {
+        const desiredState = closedTagAdded ? "closed" : "open";
+        const { data: issueData } = await octokit.request(
+          "GET /repos/{owner}/{repo}/issues/{issue_number}",
+          {
+            owner,
+            repo,
+            issue_number: issueNumber,
+          }
+        );
+
+        if (issueData.state !== desiredState) {
+          logEvent("info", "github.issue.state.update", {
+            repo: `${owner}/${repo}`,
+            issueNumber,
+            state: desiredState,
+            installationId: lastInstallationId,
+          });
+          await octokit.request("PATCH /repos/{owner}/{repo}/issues/{issue_number}", {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            state: desiredState,
+          });
+        }
+      }
+
       for (const tagId of addedTagIds) {
         const tag = tagMap.get(tagId);
         const tagName = tag?.name;
-        if (!tagName || isSyncLabel(tagName) || isRepoSelectorTag(tag) || isRepoNameTag(tagName)) continue;
+        if (
+          !tagName ||
+          isSyncLabel(tagName) ||
+          isRepoSelectorTag(tag) ||
+          isRepoNameTag(tagName) ||
+          isClosedTag(tag)
+        ) {
+          continue;
+        }
 
         logEvent("info", "github.issue.label.add", {
           repo: `${owner}/${repo}`,
@@ -414,7 +464,15 @@ async function handleThreadUpdate(oldThread, newThread) {
       for (const tagId of removedTagIds) {
         const tag = tagMap.get(tagId);
         const tagName = tag?.name;
-        if (!tagName || isSyncLabel(tagName) || isRepoSelectorTag(tag) || isRepoNameTag(tagName)) continue;
+        if (
+          !tagName ||
+          isSyncLabel(tagName) ||
+          isRepoSelectorTag(tag) ||
+          isRepoNameTag(tagName) ||
+          isClosedTag(tag)
+        ) {
+          continue;
+        }
 
         logEvent("info", "github.issue.label.remove", {
           repo: `${owner}/${repo}`,
@@ -470,6 +528,8 @@ async function handleNewThread(thread) {
     const appliedTags = thread.appliedTags || [];
     const forum = await thread.client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
 
+    await getOrCreateClosedForumTag(forum);
+
     const { repoMap, repoCount } = await getInstallationRepoMap(octokit, lastInstallationId);
     const repoFromTag = resolveRepoFromTags(appliedTags, forum.availableTags, repoMap);
 
@@ -496,6 +556,7 @@ async function handleNewThread(thread) {
       .map((id) => forum.availableTags.find((t) => t.id === id))
       .filter(Boolean)
       .filter((tag) => !isRepoSelectorTag(tag))
+      .filter((tag) => !isClosedTag(tag))
       .map((tag) => tag.name)
       .filter((name) => name && !isSyncLabel(name))
       .filter((name) => name.toLowerCase() !== repoName.toLowerCase());
@@ -552,6 +613,10 @@ async function handleNewThread(thread) {
 
     const sentMessage = await thread.send(syncMessage);
     await sentMessage.pin();
+    await setThreadCacheEntry(repoOwner, repoName, issue.number, {
+      threadId: thread.id,
+      title: issue.title,
+    });
     logEvent("info", "discord.thread.synced", {
       threadId: thread.id,
       repo: `${repoOwner}/${repoName}`,

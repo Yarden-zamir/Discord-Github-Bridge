@@ -7,11 +7,15 @@ const {
   processGitHubIssueRefs,
   hasSyncLabel,
   isSyncLabel,
+  isClosedTag,
   SYNC_LABEL,
+  CLOSED_TAG_NAME,
   sleep,
   findThreadsForIssue,
   getOrCreateForumTag,
+  getOrCreateClosedForumTag,
   REPO_TAG_EMOJI,
+  setThreadCacheEntry,
   logEvent,
   formatError,
 } = require("./utils.js");
@@ -68,12 +72,14 @@ async function withDiscordClient(fn) {
   });
 }
 
-async function createDiscordThread(client, issue, repoName) {
+async function createDiscordThread(client, issue, owner, repoName) {
   const channel = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+
+  await getOrCreateClosedForumTag(channel);
 
   logEvent("info", "discord.thread.create", {
     issueNumber: issue.number,
-    repo: repoName,
+    repo: `${owner}/${repoName}`,
   });
 
   const syncMessage = createSyncEmbed(
@@ -96,7 +102,9 @@ async function createDiscordThread(client, issue, repoName) {
   if (repoTag) tagIds.push(repoTag.id);
 
   // Add label tags
-  const labels = (issue.labels || []).filter((l) => !isSyncLabel(l.name));
+  const labels = (issue.labels || []).filter(
+    (l) => !isSyncLabel(l.name) && !isClosedTag({ name: l.name })
+  );
   for (const label of labels) {
     if (tagIds.length >= 5) break;
     const tag = await getOrCreateForumTag(channel, label.name);
@@ -112,7 +120,28 @@ async function createDiscordThread(client, issue, repoName) {
   const starterMessage = await thread.fetchStarterMessage();
   await starterMessage.pin();
 
+  await setThreadCacheEntry(owner, repoName, issue.number, {
+    threadId: thread.id,
+    title: issue.title,
+  });
+
   return thread;
+}
+
+function createIssueStatusEmbed(issue, action, actor) {
+  const isClosed = action === "closed";
+  const title = isClosed ? "Issue closed" : "Issue reopened";
+  const color = isClosed ? 0xda3633 : 0x238636;
+  const actorLine = actor ? `${isClosed ? "Closed" : "Reopened"} by **${actor}**` : "Updated on GitHub";
+  return {
+    embeds: [
+      {
+        title,
+        description: `[${issue.title} (#${issue.number})](${issue.html_url})\n${actorLine}`,
+        color,
+      },
+    ],
+  };
 }
 
 async function handleIssueComment({ octokit, payload, installationId }) {
@@ -159,7 +188,7 @@ async function handleIssueComment({ octokit, payload, installationId }) {
         label: SYNC_LABEL,
         installationId,
       });
-      await createDiscordThread(client, issue, repo);
+      await createDiscordThread(client, issue, owner, repo);
       await sleep(2000);
     }
 
@@ -174,7 +203,8 @@ async function handleIssueComment({ octokit, payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     logEvent("info", "discord.comment.sync.threads", {
@@ -198,7 +228,8 @@ async function handleIssueComment({ octokit, payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       comment.body,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     logEvent("info", "discord.comment.sync.body", {
@@ -269,7 +300,7 @@ async function handleIssueOpened({ octokit, payload, installationId }) {
       installationId,
     });
 
-    await createDiscordThread(client, issue, repo);
+    await createDiscordThread(client, issue, owner, repo);
   });
 }
 
@@ -289,29 +320,49 @@ async function handleIssueClosed({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
+    const forum = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+    const closedTag = await getOrCreateClosedForumTag(forum);
+    const closeEmbed = createIssueStatusEmbed(issue, "closed", payload.sender?.login);
+
     for (const thread of threads) {
-      if (!thread.archived) {
-        logEvent("info", "discord.thread.close_notice", {
-          repo: fullName,
-          issueNumber: issue.number,
-          threadId: thread.id,
-          installationId,
-        });
-        await thread.send(`Issue #${issue.number} was closed on GitHub: ${issue.html_url}`);
-        logEvent("info", "discord.thread.archive", {
-          repo: fullName,
-          issueNumber: issue.number,
-          threadId: thread.id,
-          installationId,
-        });
-        await thread.setArchived(true, `Issue #${issue.number} closed on GitHub`);
+      logEvent("info", "discord.thread.close_notice", {
+        repo: fullName,
+        issueNumber: issue.number,
+        threadId: thread.id,
+        installationId,
+      });
+      await thread.send(closeEmbed);
+
+      if (closedTag) {
+        const currentTags = thread.appliedTags || [];
+        if (!currentTags.includes(closedTag.id)) {
+          if (currentTags.length >= 5) {
+            logEvent("warn", "discord.thread.tag.limit", {
+              repo: fullName,
+              issueNumber: issue.number,
+              threadId: thread.id,
+              label: CLOSED_TAG_NAME,
+              installationId,
+            });
+          } else {
+            await thread.setAppliedTags([...currentTags, closedTag.id]);
+            logEvent("info", "discord.thread.tag.add", {
+              repo: fullName,
+              issueNumber: issue.number,
+              threadId: thread.id,
+              label: CLOSED_TAG_NAME,
+              installationId,
+            });
+          }
+        }
       }
     }
 
-    logEvent("info", "discord.thread.archive.complete", {
+    logEvent("info", "discord.thread.close.complete", {
       repo: fullName,
       issueNumber: issue.number,
       threadCount: threads.length,
@@ -336,27 +387,89 @@ async function handleIssueReopened({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
+    const forum = await client.channels.fetch(env.DISCORD_INPUT_FORUM_CHANNEL_ID);
+    const closedTag = await getOrCreateClosedForumTag(forum);
+    const reopenEmbed = createIssueStatusEmbed(issue, "reopened", payload.sender?.login);
+
     for (const thread of threads) {
-      if (thread.archived) {
-        logEvent("info", "discord.thread.unarchive", {
-          repo: fullName,
-          issueNumber: issue.number,
-          threadId: thread.id,
-          installationId,
-        });
-        await thread.setArchived(false, `Issue #${issue.number} reopened on GitHub`);
+      logEvent("info", "discord.thread.reopen_notice", {
+        repo: fullName,
+        issueNumber: issue.number,
+        threadId: thread.id,
+        installationId,
+      });
+      await thread.send(reopenEmbed);
+
+      if (closedTag) {
+        const currentTags = thread.appliedTags || [];
+        if (currentTags.includes(closedTag.id)) {
+          await thread.setAppliedTags(currentTags.filter((id) => id !== closedTag.id));
+          logEvent("info", "discord.thread.tag.remove", {
+            repo: fullName,
+            issueNumber: issue.number,
+            threadId: thread.id,
+            label: CLOSED_TAG_NAME,
+            installationId,
+          });
+        }
       }
     }
 
-    logEvent("info", "discord.thread.unarchive.complete", {
+    logEvent("info", "discord.thread.reopen.complete", {
       repo: fullName,
       issueNumber: issue.number,
       threadCount: threads.length,
       installationId,
     });
+  });
+}
+
+async function handleIssueEdited({ payload, installationId }) {
+  const { owner, repo, fullName } = getRepoInfo(payload.repository);
+  const issue = payload.issue;
+  const titleChange = payload.changes?.title;
+
+  if (!titleChange || !titleChange.from) {
+    return;
+  }
+
+  logEvent("info", "github.issue.edited", {
+    repo: fullName,
+    issueNumber: issue.number,
+    installationId,
+  });
+
+  await withDiscordClient(async (client) => {
+    const threads = await findThreadsForIssue(
+      client,
+      env.DISCORD_INPUT_FORUM_CHANNEL_ID,
+      issue.number,
+      owner,
+      repo,
+      issue.title
+    );
+
+    for (const thread of threads) {
+      if (thread.name !== issue.title) {
+        logEvent("info", "discord.thread.rename", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          oldTitle: thread.name,
+          newTitle: issue.title,
+          installationId,
+        });
+        await thread.setName(issue.title);
+        await setThreadCacheEntry(owner, repo, issue.number, {
+          threadId: thread.id,
+          title: issue.title,
+        });
+      }
+    }
   });
 }
 
@@ -372,8 +485,8 @@ async function handleIssueLabeled({ payload, installationId }) {
     installationId,
   });
 
-  // Skip sync label and repo name tags
-  if (isSyncLabel(label.name) || label.name === repo) {
+  // Skip sync label, repo name tags, and closed tag
+  if (isSyncLabel(label.name) || label.name === repo || isClosedTag({ name: label.name })) {
     return;
   }
 
@@ -383,7 +496,8 @@ async function handleIssueLabeled({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     if (threads.length === 0) {
@@ -440,8 +554,8 @@ async function handleIssueUnlabeled({ payload, installationId }) {
     installationId,
   });
 
-  // Skip sync label and repo name tags
-  if (isSyncLabel(label.name) || label.name === repo) {
+  // Skip sync label, repo name tags, and closed tag
+  if (isSyncLabel(label.name) || label.name === repo || isClosedTag({ name: label.name })) {
     return;
   }
 
@@ -451,7 +565,8 @@ async function handleIssueUnlabeled({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     if (threads.length === 0) {
@@ -501,7 +616,8 @@ async function handleIssueMilestoned({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     if (threads.length === 0) {
@@ -551,7 +667,8 @@ async function handleIssueAssigned({ payload, installationId }) {
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
       issue.number,
       owner,
-      repo
+      repo,
+      issue.title
     );
 
     if (threads.length === 0) {
@@ -588,6 +705,7 @@ module.exports = {
   handleIssueOpened,
   handleIssueClosed,
   handleIssueReopened,
+  handleIssueEdited,
   handleIssueLabeled,
   handleIssueUnlabeled,
   handleIssueMilestoned,

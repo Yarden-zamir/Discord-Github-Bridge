@@ -1,5 +1,7 @@
 const { Client, GatewayIntentBits } = require("discord.js");
 const { env } = require("process");
+const fs = require("fs/promises");
+const path = require("path");
 
 const DISCORD_INTENTS = [
   GatewayIntentBits.GuildMessages,
@@ -10,6 +12,11 @@ const DISCORD_INTENTS = [
 
 const SYNC_LABEL = "🔵-synced";
 const REPO_TAG_EMOJI = env.REPO_TAG_EMOJI || "🧭";
+const CLOSED_TAG_NAME = env.CLOSED_TAG_NAME || "closed";
+const CLOSED_TAG_EMOJI = env.CLOSED_TAG_EMOJI || "✅";
+const CLOSED_TAG_LEGACY_NAME = "✅closed";
+const THREAD_CACHE_PATH = env.THREAD_CACHE_PATH || path.join(process.cwd(), "thread-cache.json");
+const THREAD_CACHE_SAVE_DELAY_MS = 2000;
 
 function logEvent(level, event, meta = {}) {
   const payload = { time: new Date().toISOString(), level, event, ...meta };
@@ -39,6 +46,117 @@ function getTagEmojiName(tag) {
   if (!tag) return null;
   if (typeof tag.emoji === "string") return tag.emoji;
   return tag.emoji?.name || null;
+}
+
+function isRepoSelectorTag(tag) {
+  return getTagEmojiName(tag) === REPO_TAG_EMOJI;
+}
+
+function isClosedTagName(name) {
+  if (!name) return false;
+  const normalized = name.toLowerCase();
+  return (
+    normalized === CLOSED_TAG_NAME.toLowerCase() ||
+    normalized === CLOSED_TAG_LEGACY_NAME.toLowerCase()
+  );
+}
+
+function isClosedTag(tag) {
+  if (!tag) return false;
+  if (getTagEmojiName(tag) === CLOSED_TAG_EMOJI) return true;
+  return isClosedTagName(tag.name);
+}
+
+function findClosedForumTag(forum) {
+  return forum.availableTags.find((tag) => isClosedTag(tag)) || null;
+}
+
+async function getOrCreateClosedForumTag(forum) {
+  const existing = findClosedForumTag(forum);
+  if (existing) {
+    const hasLegacyName = existing.name?.toLowerCase() === CLOSED_TAG_LEGACY_NAME.toLowerCase();
+    if (!hasLegacyName && getTagEmojiName(existing) !== CLOSED_TAG_EMOJI) {
+      await getOrCreateForumTag(forum, existing.name, CLOSED_TAG_EMOJI);
+      return findClosedForumTag(await forum.fetch());
+    }
+    return existing;
+  }
+  return getOrCreateForumTag(forum, CLOSED_TAG_NAME, CLOSED_TAG_EMOJI);
+}
+
+const threadCache = new Map();
+let threadCacheLoaded = false;
+let threadCacheSaveTimer = null;
+
+function getThreadCacheKey(owner, repo, issueNumber) {
+  return `${owner.toLowerCase()}/${repo.toLowerCase()}#${issueNumber}`;
+}
+
+async function loadThreadCache() {
+  if (threadCacheLoaded) return;
+  threadCacheLoaded = true;
+  try {
+    const raw = await fs.readFile(THREAD_CACHE_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    const entries = parsed?.entries || parsed;
+    if (entries && typeof entries === "object") {
+      for (const [key, value] of Object.entries(entries)) {
+        if (value && value.threadId) {
+          threadCache.set(key, value);
+        }
+      }
+    }
+    logEvent("info", "thread_cache.load", { path: THREAD_CACHE_PATH, count: threadCache.size });
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      logEvent("error", "thread_cache.load.error", {
+        path: THREAD_CACHE_PATH,
+        error: formatError(err),
+      });
+    }
+  }
+}
+
+function scheduleThreadCacheSave() {
+  if (threadCacheSaveTimer) return;
+  threadCacheSaveTimer = setTimeout(() => {
+    threadCacheSaveTimer = null;
+    saveThreadCache().catch((err) => {
+      logEvent("error", "thread_cache.save.error", {
+        path: THREAD_CACHE_PATH,
+        error: formatError(err),
+      });
+    });
+  }, THREAD_CACHE_SAVE_DELAY_MS);
+}
+
+async function saveThreadCache() {
+  const payload = { entries: Object.fromEntries(threadCache) };
+  await fs.writeFile(THREAD_CACHE_PATH, JSON.stringify(payload, null, 2));
+  logEvent("info", "thread_cache.save", { path: THREAD_CACHE_PATH, count: threadCache.size });
+}
+
+async function getThreadCacheEntry(owner, repo, issueNumber) {
+  if (!owner || !repo || !issueNumber) return null;
+  await loadThreadCache();
+  return threadCache.get(getThreadCacheKey(owner, repo, issueNumber)) || null;
+}
+
+async function setThreadCacheEntry(owner, repo, issueNumber, entry) {
+  if (!owner || !repo || !issueNumber || !entry?.threadId) return;
+  await loadThreadCache();
+  threadCache.set(getThreadCacheKey(owner, repo, issueNumber), {
+    ...entry,
+    updatedAt: Date.now(),
+  });
+  scheduleThreadCacheSave();
+}
+
+async function deleteThreadCacheEntry(owner, repo, issueNumber) {
+  if (!owner || !repo || !issueNumber) return;
+  await loadThreadCache();
+  threadCache.delete(getThreadCacheKey(owner, repo, issueNumber));
+  scheduleThreadCacheSave();
 }
 
 function getTargetRepo() {
@@ -116,7 +234,7 @@ function processMessageContent(message) {
 }
 
 async function getSyncedIssueInfo(channel) {
-  const pinnedMessages = await channel.messages.fetchPinned();
+  const pinnedMessages = await channel.messages.fetchPins();
   const issues = [];
 
   pinnedMessages.forEach((message) => {
@@ -340,9 +458,46 @@ async function getOrCreateGitHubLabel(octokit, owner, repo, labelName) {
   }
 }
 
-async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = null, repo = null) {
+async function findThreadsForIssue(
+  client,
+  forumChannelId,
+  issueNumber,
+  owner = null,
+  repo = null,
+  issueTitle = null
+) {
   const threads = [];
   const forum = await client.channels.fetch(forumChannelId);
+
+  if (owner && repo) {
+    const cached = await getThreadCacheEntry(owner, repo, issueNumber);
+    if (cached?.threadId) {
+      try {
+        const cachedThread = await client.channels.fetch(cached.threadId);
+        if (cachedThread && cachedThread.parentId === forumChannelId) {
+          logEvent("info", "discord.thread.cache.hit", {
+            forumId: forumChannelId,
+            issueNumber,
+            owner,
+            repo,
+            threadId: cached.threadId,
+          });
+          return [cachedThread];
+        }
+        await deleteThreadCacheEntry(owner, repo, issueNumber);
+      } catch (err) {
+        await deleteThreadCacheEntry(owner, repo, issueNumber);
+        logEvent("warn", "discord.thread.cache.invalid", {
+          forumId: forumChannelId,
+          issueNumber,
+          owner,
+          repo,
+          threadId: cached.threadId,
+          error: formatError(err),
+        });
+      }
+    }
+  }
 
   logEvent("info", "discord.thread.search.start", {
     forumId: forumChannelId,
@@ -393,19 +548,55 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
     }
   }
 
+  const repoLower = repo ? repo.toLowerCase() : null;
+  const repoTagIds = repoLower
+    ? forum.availableTags
+        .filter((tag) => isRepoSelectorTag(tag) && tag.name.toLowerCase() === repoLower)
+        .map((tag) => tag.id)
+    : [];
+
+  const taggedThreads = repoTagIds.length
+    ? allThreads.filter((thread) =>
+        (thread.appliedTags || []).some((tagId) => repoTagIds.includes(tagId))
+      )
+    : [];
+
+  const candidateThreads = taggedThreads.length ? taggedThreads : allThreads;
+
+  logEvent("info", "discord.thread.search.candidates", {
+    forumId: forumChannelId,
+    issueNumber,
+    candidateCount: candidateThreads.length,
+    repoTaggedCount: taggedThreads.length,
+  });
+
+  const normalizedIssueTitle = issueTitle
+    ? issueTitle.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+    : null;
+
+  const orderedThreads = [...candidateThreads].sort((a, b) => {
+    if (!normalizedIssueTitle) return 0;
+    const aName = a.name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const bName = b.name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const aMatch = normalizedIssueTitle && (aName.includes(normalizedIssueTitle) || normalizedIssueTitle.includes(aName));
+    const bMatch = normalizedIssueTitle && (bName.includes(normalizedIssueTitle) || normalizedIssueTitle.includes(bName));
+    if (aMatch === bMatch) return 0;
+    return aMatch ? -1 : 1;
+  });
+
   const PIN_FETCH_TIMEOUT_MS = 20000;
   const fetchPinnedWithTimeout = async (thread) => {
     const timeoutError = new Error("Pinned fetch timeout");
     timeoutError.code = "PIN_FETCH_TIMEOUT";
     return Promise.race([
-      thread.messages.fetchPinned(),
+      thread.messages.fetchPins(),
       new Promise((_, reject) =>
         setTimeout(() => reject(timeoutError), PIN_FETCH_TIMEOUT_MS)
       ),
     ]);
   };
 
-  for (const thread of allThreads) {
+  for (const thread of orderedThreads) {
     logEvent("info", "discord.thread.search.pin.start", {
       forumId: forumChannelId,
       issueNumber,
@@ -457,6 +648,10 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
             owner: msgOwner,
             repo: msgRepo,
           });
+          await setThreadCacheEntry(msgOwner, msgRepo, issueNumber, {
+            threadId: thread.id,
+            title: thread.name,
+          });
           break;
         }
         continue;
@@ -479,9 +674,19 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
             owner: msgOwner,
             repo: msgRepo,
           });
+          if (msgOwner && msgRepo) {
+            await setThreadCacheEntry(msgOwner, msgRepo, issueNumber, {
+              threadId: thread.id,
+              title: thread.name,
+            });
+          }
           break;
         }
       }
+    }
+
+    if (threads.length > 0) {
+      break;
     }
   }
 
@@ -498,6 +703,8 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
 module.exports = {
   SYNC_LABEL,
   REPO_TAG_EMOJI,
+  CLOSED_TAG_NAME,
+  CLOSED_TAG_EMOJI,
   logEvent,
   formatError,
   getDefaultRepo,
@@ -506,6 +713,9 @@ module.exports = {
   getRandomColor,
   createDiscordClient,
   isForumThread,
+  isRepoSelectorTag,
+  isClosedTag,
+  isClosedTagName,
   processMessageContent,
   getSyncedIssueInfo,
   getSyncedIssueNumbers,
@@ -518,5 +728,9 @@ module.exports = {
   sleep,
   findThreadsForIssue,
   getOrCreateForumTag,
+  getOrCreateClosedForumTag,
   getOrCreateGitHubLabel,
+  getThreadCacheEntry,
+  setThreadCacheEntry,
+  deleteThreadCacheEntry,
 };
