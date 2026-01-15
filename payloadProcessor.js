@@ -153,6 +153,12 @@ async function handleIssueComment({ octokit, payload, installationId }) {
       await sleep(2000);
     }
 
+    logEvent("info", "discord.comment.sync.start", {
+      repo: fullName,
+      issueNumber: issue.number,
+      installationId,
+    });
+
     const threads = await findThreadsForIssue(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
@@ -161,6 +167,22 @@ async function handleIssueComment({ octokit, payload, installationId }) {
       repo
     );
 
+    logEvent("info", "discord.comment.sync.threads", {
+      repo: fullName,
+      issueNumber: issue.number,
+      threadCount: threads.length,
+      installationId,
+    });
+
+    if (threads.length === 0) {
+      logEvent("warn", "discord.comment.sync.no_threads", {
+        repo: fullName,
+        issueNumber: issue.number,
+        installationId,
+      });
+      return;
+    }
+
     const processedBody = await processGitHubIssueRefs(
       client,
       env.DISCORD_INPUT_FORUM_CHANNEL_ID,
@@ -168,6 +190,13 @@ async function handleIssueComment({ octokit, payload, installationId }) {
       owner,
       repo
     );
+
+    logEvent("info", "discord.comment.sync.body", {
+      repo: fullName,
+      issueNumber: issue.number,
+      length: processedBody.length,
+      installationId,
+    });
 
     for (const thread of threads) {
       logEvent("info", "discord.comment.sync", {
@@ -255,6 +284,13 @@ async function handleIssueClosed({ payload, installationId }) {
 
     for (const thread of threads) {
       if (!thread.archived) {
+        logEvent("info", "discord.thread.close_notice", {
+          repo: fullName,
+          issueNumber: issue.number,
+          threadId: thread.id,
+          installationId,
+        });
+        await thread.send(`Issue #${issue.number} was closed on GitHub: ${issue.html_url}`);
         logEvent("info", "discord.thread.archive", {
           repo: fullName,
           issueNumber: issue.number,
