@@ -1,12 +1,24 @@
-const { App } = require("@octokit/app");
-const { Webhooks, createNodeMiddleware } = require("@octokit/webhooks");
 const { env } = require("process");
 const { logEvent } = require("./utils.js");
 
 let app = null;
 let webhooks = null;
+let AppClass = null;
+let WebhooksClass = null;
+let createNodeMiddlewareFn = null;
 
-function getApp() {
+async function loadOctokitModules() {
+  if (AppClass && WebhooksClass && createNodeMiddlewareFn) return;
+
+  const appModule = await import("@octokit/app");
+  const webhookModule = await import("@octokit/webhooks");
+
+  AppClass = appModule.App;
+  WebhooksClass = webhookModule.Webhooks;
+  createNodeMiddlewareFn = webhookModule.createNodeMiddleware;
+}
+
+async function getApp() {
   if (!app) {
     if (!env.GITHUB_APP_ID) {
       throw new Error("GITHUB_APP_ID env var not set");
@@ -19,9 +31,11 @@ function getApp() {
       ? env.GITHUB_APP_PRIVATE_KEY
       : require("fs").readFileSync(env.GITHUB_APP_PRIVATE_KEY, "utf8");
 
+    await loadOctokitModules();
+
     logEvent("info", "github.app.init", { appId: env.GITHUB_APP_ID });
 
-    app = new App({
+    app = new AppClass({
       appId: env.GITHUB_APP_ID,
       privateKey,
     });
@@ -29,23 +43,27 @@ function getApp() {
   return app;
 }
 
-function getWebhooks() {
+async function getWebhooks() {
   if (!webhooks) {
-    webhooks = new Webhooks({
+    await loadOctokitModules();
+    webhooks = new WebhooksClass({
       secret: env.GITHUB_WEBHOOK_SECRET || "development",
     });
   }
   return webhooks;
 }
 
-function getWebhookMiddleware() {
-  return createNodeMiddleware(getWebhooks(), {
+async function getWebhookMiddleware() {
+  await loadOctokitModules();
+  const activeWebhooks = await getWebhooks();
+  return createNodeMiddlewareFn(activeWebhooks, {
     path: "/github/webhooks",
   });
 }
 
 async function getInstallationOctokit(installationId) {
-  return getApp().getInstallationOctokit(installationId);
+  const currentApp = await getApp();
+  return currentApp.getInstallationOctokit(installationId);
 }
 
 module.exports = {

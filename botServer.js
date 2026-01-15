@@ -140,8 +140,8 @@ function resolveRepoFromTags(appliedTags, availableTags, repoMap) {
 }
 
 // Initialize GitHub App and register webhook handlers
-function setupWebhooks() {
-  const webhooks = getWebhooks();
+async function setupWebhooks() {
+  const webhooks = await getWebhooks();
 
   // Wrap handlers to inject octokit from installation ID
   const wrapHandler = (handler, eventName) => async (context) => {
@@ -185,13 +185,22 @@ function setupWebhooks() {
   });
 
   // Use the middleware
-  expressApp.use(getWebhookMiddleware());
+  const webhookMiddleware = await getWebhookMiddleware();
+  expressApp.use(webhookMiddleware);
 
   logEvent("info", "github.webhook.registered");
 }
 
-expressApp.listen(PORT, () => {
-  logEvent("info", "server.start", { port: PORT });
+async function startServer() {
+  await setupWebhooks();
+  expressApp.listen(PORT, () => {
+    logEvent("info", "server.start", { port: PORT });
+  });
+}
+
+startServer().catch((err) => {
+  logEvent("error", "server.start.error", { error: formatError(err) });
+  process.exit(1);
 });
 
 function extractDiscordUsername(commentBody) {
