@@ -344,21 +344,52 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
   const threads = [];
   const forum = await client.channels.fetch(forumChannelId);
 
+  logEvent("info", "discord.thread.search.start", {
+    forumId: forumChannelId,
+    issueNumber,
+    owner,
+    repo,
+  });
+
   // Fetch active threads
   const activeThreads = await forum.threads.fetchActive();
   const allThreads = [...activeThreads.threads.values()];
+  logEvent("info", "discord.thread.search.active", {
+    forumId: forumChannelId,
+    issueNumber,
+    count: allThreads.length,
+  });
 
   // Fetch all archived threads (paginated)
   let hasMore = true;
   let before;
+  let archivedPages = 0;
   while (hasMore) {
-    const archived = await forum.threads.fetchArchived({ before, limit: 100 });
-    allThreads.push(...archived.threads.values());
-    hasMore = archived.hasMore;
-    if (archived.threads.size > 0) {
-      before = archived.threads.last().id;
-    } else {
-      hasMore = false;
+    try {
+      const archived = await forum.threads.fetchArchived({ before, limit: 100 });
+      const pageCount = archived.threads.size;
+      allThreads.push(...archived.threads.values());
+      hasMore = archived.hasMore;
+      archivedPages += 1;
+      logEvent("info", "discord.thread.search.archived_page", {
+        forumId: forumChannelId,
+        issueNumber,
+        page: archivedPages,
+        count: pageCount,
+        hasMore,
+      });
+      if (pageCount > 0) {
+        before = archived.threads.last().id;
+      } else {
+        hasMore = false;
+      }
+    } catch (err) {
+      logEvent("error", "discord.thread.search.archived_error", {
+        forumId: forumChannelId,
+        issueNumber,
+        error: formatError(err),
+      });
+      break;
     }
   }
 
@@ -377,6 +408,13 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
 
         if (msgIssueNum === issueNumber && (!owner || !repo || (msgOwner === owner && msgRepo === repo))) {
           threads.push(thread);
+          logEvent("info", "discord.thread.search.match", {
+            forumId: forumChannelId,
+            issueNumber,
+            threadId: thread.id,
+            owner: msgOwner,
+            repo: msgRepo,
+          });
           break;
         }
         continue;
@@ -392,11 +430,25 @@ async function findThreadsForIssue(client, forumChannelId, issueNumber, owner = 
 
         if (msgIssueNum === issueNumber && (!owner || !repo || !msgOwner || !msgRepo || (msgOwner === owner && msgRepo === repo))) {
           threads.push(thread);
+          logEvent("info", "discord.thread.search.match", {
+            forumId: forumChannelId,
+            issueNumber,
+            threadId: thread.id,
+            owner: msgOwner,
+            repo: msgRepo,
+          });
           break;
         }
       }
     }
   }
+
+  logEvent("info", "discord.thread.search.complete", {
+    forumId: forumChannelId,
+    issueNumber,
+    matches: threads.length,
+    totalThreads: allThreads.length,
+  });
 
   return threads;
 }
