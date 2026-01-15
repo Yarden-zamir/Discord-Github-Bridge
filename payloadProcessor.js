@@ -45,6 +45,16 @@ async function withDiscordClient(fn) {
     });
 
     client.once(Events.ClientReady, async () => {
+      client.rest.on("rateLimited", (info) => {
+        logEvent("warn", "discord.rate_limited", {
+          timeout: info.timeout,
+          limit: info.limit,
+          method: info.method,
+          route: info.route,
+          global: info.global,
+        });
+      });
+
       try {
         await fn(client);
         resolve();
