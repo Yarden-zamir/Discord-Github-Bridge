@@ -234,7 +234,8 @@ function processMessageContent(message) {
 }
 
 async function getSyncedIssueInfo(channel) {
-  const pinnedMessages = await channel.messages.fetchPins();
+  const pinnedResult = await channel.messages.fetchPins();
+  const pinnedMessages = (pinnedResult.items || []).map((item) => item.message);
   const issues = [];
 
   pinnedMessages.forEach((message) => {
@@ -604,9 +605,9 @@ async function findThreadsForIssue(
       archived: thread.archived,
     });
 
-    let pinnedMessages;
+    let pinnedResult;
     try {
-      pinnedMessages = await fetchPinnedWithTimeout(thread);
+      pinnedResult = await fetchPinnedWithTimeout(thread);
     } catch (err) {
       if (err.code === "PIN_FETCH_TIMEOUT") {
         logEvent("warn", "discord.thread.search.pin.timeout", {
@@ -628,7 +629,10 @@ async function findThreadsForIssue(
       continue;
     }
 
-    for (const [, message] of pinnedMessages) {
+    const pinnedMessages = pinnedResult?.items || [];
+
+    for (const item of pinnedMessages) {
+      const message = item.message;
       // Parse synced issue info from pinned message
       const content = message.content;
 
