@@ -11,7 +11,7 @@ const DISCORD_INTENTS = [
 ];
 
 const SYNC_LABEL = "🔵-synced";
-const REPO_TAG_EMOJI = env.REPO_TAG_EMOJI || "🧭";
+const REPO_TAG_EMOJI = env.REPO_TAG_EMOJI?.trim() || "🧭";
 const CLOSED_TAG_NAME = env.CLOSED_TAG_NAME || "closed";
 const CLOSED_TAG_EMOJI = env.CLOSED_TAG_EMOJI || "✅";
 const CLOSED_TAG_LEGACY_NAME = "✅closed";
